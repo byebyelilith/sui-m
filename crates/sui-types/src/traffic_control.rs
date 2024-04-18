@@ -10,6 +10,30 @@ use std::{fmt::Debug, path::PathBuf};
 
 const TRAFFIC_SINK_TIMEOUT_SEC: u64 = 300;
 
+pub struct Weight(f32);
+
+impl Weight {
+    pub fn new(value: f32) -> Result<Self, &'static str> {
+        if (0.0..=1.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err("Weight must be between 0.0 and 1.0")
+        }
+    }
+
+    pub fn one() -> Self {
+        Self(1.0)
+    }
+
+    pub fn zero() -> Self {
+        Self(0.0)
+    }
+
+    pub fn value(&self) -> f32 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ServiceResponse {
     Validator(SuiResult),

@@ -20,16 +20,31 @@ use jsonrpsee::types::{ErrorObject, Id, InvalidRequest, Params, Request};
 use jsonrpsee::{core::server::rpc_module::Methods, server::logger::Logger};
 use serde_json::value::{RawValue, Value};
 use sui_core::traffic_controller::{
-    metrics::TrafficControllerMetrics, policies::TrafficTally, TrafficController,
+    metrics::TrafficControllerMetrics, policies::TrafficTally, ErrorNormalizer, TrafficController,
 };
 use sui_types::error::{SuiError, SuiResult};
-use sui_types::traffic_control::PolicyConfig;
+use sui_types::traffic_control::{PolicyConfig, Weight};
 
 use crate::routing_layer::RpcRouter;
 use sui_json_rpc_api::CLIENT_TARGET_API_VERSION_HEADER;
 
 pub const MAX_RESPONSE_SIZE: u32 = 2 << 30;
 const TOO_MANY_REQUESTS_MSG: &str = "Too many requests";
+
+#[derive(Clone)]
+struct JsonRpcNormalizer;
+
+unsafe impl Send for JsonRpcNormalizer {}
+unsafe impl Sync for JsonRpcNormalizer {}
+
+impl ErrorNormalizer<ErrorCode> for JsonRpcNormalizer {
+    fn normalize(&self, err: ErrorCode) -> Weight {
+        match err {
+            ErrorCode::InvalidRequest | ErrorCode::InvalidParams => Weight::one(),
+            _ => Weight::zero(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct JsonRpcService<L> {
@@ -62,6 +77,7 @@ impl<L> JsonRpcService<L> {
                     policy,
                     traffic_controller_metrics,
                     remote_fw_config,
+                    JsonRpcNormalizer {},
                 ))
             }),
         }
@@ -188,10 +204,11 @@ fn handle_traffic_resp(
     client_ip: SocketAddr,
     response: &MethodResponse,
 ) {
+    let error = resp.error_code.map(ErrorCode::from);
     traffic_controller.tally(TrafficTally {
         connection_ip: Some(client_ip.ip()),
         proxy_ip: None,
-        result: ServiceResponse::Fullnode(response.clone()),
+        error,
         timestamp: SystemTime::now(),
     });
 }

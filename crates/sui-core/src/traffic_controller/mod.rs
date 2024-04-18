@@ -12,6 +12,7 @@ use prometheus::IntGauge;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 
 use self::metrics::TrafficControllerMetrics;
 use crate::traffic_controller::nodefw_client::{BlockAddress, BlockAddresses, NodeFWClient};
@@ -23,9 +24,8 @@ use mysten_metrics::spawn_monitored_task;
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime};
 use sui_types::error::SuiError;
-use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig, ServiceResponse};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
+use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig, ServiceResponse, Weight};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 type BlocklistT = Arc<DashMap<IpAddr, SystemTime>>;
@@ -36,14 +36,25 @@ struct Blocklists {
     proxy_ips: BlocklistT,
 }
 
+/// Interface to be implemented by all servers that leverage TrafficController.
+/// This removes the need for TrafficController to understand the error types
+/// and their relative severity wrt traffic control.
+pub trait ErrorNormalizer<E: std::error::Error> {
+    /// For a server whose error type is E, normalize any given E
+    /// into a weight, defined as a value between 0.0 and 1.0. This
+    /// is to be used by policies to adjust the probability that an
+    /// error type contributes to frequency-based blocklisting.
+    fn normalize(&self, err: E) -> Weight;
+}
+
 #[derive(Clone)]
-pub struct TrafficController {
-    tally_channel: mpsc::Sender<TrafficTally>,
+pub struct TrafficController<E: std::error::Error + Clone> {
+    tally_channel: broadcast::Sender<Arc<TrafficTally<E>>>,
     blocklists: Blocklists,
     metrics: Arc<TrafficControllerMetrics>,
 }
 
-impl Debug for TrafficController {
+impl<E: std::error::Error + Clone> Debug for TrafficController<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // NOTE: we do not want to print the contents of the blocklists to logs
         // given that (1) it contains all requests IPs, and (2) it could be quite
@@ -63,14 +74,18 @@ impl Debug for TrafficController {
     }
 }
 
-impl TrafficController {
-    pub fn spawn(
+impl<E: std::error::Error + Clone> TrafficController<E> {
+    pub fn spawn<T>(
         policy_config: PolicyConfig,
         metrics: TrafficControllerMetrics,
         fw_config: Option<RemoteFirewallConfig>,
-    ) -> Self {
+        normalizer: T,
+    ) -> Self
+    where
+        T: ErrorNormalizer<E>,
+    {
         let metrics = Arc::new(metrics);
-        let (tx, rx) = mpsc::channel(policy_config.channel_capacity);
+        let (tx, rx) = broadcast::channel(policy_config.channel_capacity);
         // Memoized drainfile existence state. This is passed into delegation
         // funtions to prevent them from continuing to populate blocklists
         // if drain is set, as otherwise it will grow without bounds
@@ -96,37 +111,27 @@ impl TrafficController {
             blocklists,
             metrics,
             mem_drainfile_present,
+            normalizer,
         ));
         ret
     }
 
-    pub fn spawn_for_test(
+    pub fn spawn_for_test<T>(
         policy_config: PolicyConfig,
         fw_config: Option<RemoteFirewallConfig>,
-    ) -> Self {
+        normalizer: T,
+    ) -> Self
+    where
+        T: ErrorNormalizer<E>,
+    {
         let metrics = TrafficControllerMetrics::new(&prometheus::Registry::new());
-        Self::spawn(policy_config, metrics, fw_config)
+        Self::spawn(policy_config, metrics, fw_config, normalizer)
     }
 
-    pub fn tally(&self, tally: TrafficTally) {
-        // Use try_send rather than send mainly to avoid creating backpressure
-        // on the caller if the channel is full, which may slow down the critical
-        // path. Dropping the tally on the floor should be ok, as in this case
-        // we are effectively sampling traffic, which we would need to do anyway
-        // if we are overloaded
-        match self.tally_channel.try_send(tally) {
-            Err(TrySendError::Full(_)) => {
-                warn!("TrafficController tally channel full, dropping tally");
-                self.metrics.tally_channel_overflow.inc();
-                // TODO: once we've verified this doesn't happen under normal
-                // conditions, we can consider dropping the request itself given
-                // that clearly the system is overloaded
-            }
-            Err(TrySendError::Closed(_)) => {
-                panic!("TrafficController tally channel closed unexpectedly");
-            }
-            Ok(_) => {}
-        }
+    pub fn tally(&self, tally: Arc<TrafficTally<E>>) {
+        self.tally_channel
+            .send(tally)
+            .expect("TrafficController tally channel closed unexpectedly");
     }
 
     /// Returns true if the connection is allowed, false if it is blocked
@@ -204,13 +209,14 @@ fn is_tallyable_error(response: &ServiceResponse) -> bool {
     }
 }
 
-async fn run_tally_loop(
-    mut receiver: mpsc::Receiver<TrafficTally>,
+async fn run_tally_loop<E: std::error::Error + Clone>(
+    mut receiver: broadcast::Receiver<Arc<TrafficTally<E>>>,
     policy_config: PolicyConfig,
     fw_config: Option<RemoteFirewallConfig>,
     blocklists: Blocklists,
     metrics: Arc<TrafficControllerMetrics>,
     mut mem_drainfile_present: bool,
+    normalizer: impl ErrorNormalizer<E>,
 ) {
     let mut spam_policy = TrafficControlPolicy::from_spam_config(policy_config.clone()).await;
     let mut error_policy = TrafficControlPolicy::from_error_config(policy_config.clone()).await;
@@ -227,10 +233,20 @@ async fn run_tally_loop(
 
     loop {
         tokio::select! {
+            // Note that channel overflow is handled by overwriting
+            // rather than backpressure. This is good from a critical path
+            // performance perspective, and generally suggests that the node
+            // is under heavy load and we should be dropping requests. Assume
+            // for now that this will be handled downstream by load shedding.
+            //
+            // TODO: we can minimze the above by running multiple tally handler
+            // tasks. This will complicate the policy implementation considerably.
+            // Perhaps first step is to separate spam and error policies into
+            // separate tasks.
             received = receiver.recv() => {
                 metrics.tallies.inc();
                 match received {
-                    Some(tally) => {
+                    Ok(tally) => {
                         // TODO: spawn a task to handle tallying concurrently
                         if let Err(err) = handle_spam_tally(
                             &mut spam_policy,
@@ -254,13 +270,19 @@ async fn run_tally_loop(
                             error_blocklists.clone(),
                             metrics.clone(),
                             mem_drainfile_present,
+                            &normalizer,
                         )
                         .await {
                             warn!("Error handling error tally: {}", err);
                         }
                     }
-                    None => {
+                    Err(RecvError::Closed) => {
                         info!("TrafficController tally channel closed by all senders");
+                        return;
+                    }
+                    Err(RecvError::Lagged(num_skipped)) => {
+                        metrics.tally_channel_lag.inc_by(num_skipped as u64);
+                        warn!("TrafficController tally channel lagged by {num_skipped} messages");
                         return;
                     }
                 }
@@ -284,23 +306,23 @@ async fn run_tally_loop(
     }
 }
 
-async fn handle_error_tally(
+async fn handle_error_tally<E: std::error::Error + Clone>(
     policy: &mut TrafficControlPolicy,
     policy_config: &PolicyConfig,
     nodefw_client: &Option<NodeFWClient>,
     fw_config: &Option<RemoteFirewallConfig>,
-    tally: TrafficTally,
+    tally: Arc<TrafficTally<E>>,
     blocklists: Arc<Blocklists>,
     metrics: Arc<TrafficControllerMetrics>,
     mem_drainfile_present: bool,
+    normalizer: &impl ErrorNormalizer<E>,
 ) -> Result<(), reqwest::Error> {
-    if tally.result.is_ok() {
+    if tally.error.is_none() {
         return Ok(());
     }
-    if !is_tallyable_error(&tally.result) {
-        return Ok(());
-    }
-    let resp = policy.handle_tally(tally.clone());
+    let err = tally.error.clone().unwrap();
+    let weight = normalizer.normalize(err.lock().clone());
+    let resp = policy.handle_tally(tally.clone(), weight);
     if let Some(fw_config) = fw_config {
         if fw_config.delegate_error_blocking && !mem_drainfile_present {
             let client = nodefw_client
@@ -320,17 +342,17 @@ async fn handle_error_tally(
     Ok(())
 }
 
-async fn handle_spam_tally(
+async fn handle_spam_tally<E: std::error::Error + Clone>(
     policy: &mut TrafficControlPolicy,
     policy_config: &PolicyConfig,
     nodefw_client: &Option<NodeFWClient>,
     fw_config: &Option<RemoteFirewallConfig>,
-    tally: TrafficTally,
+    tally: Arc<TrafficTally<E>>,
     blocklists: Arc<Blocklists>,
     metrics: Arc<TrafficControllerMetrics>,
     mem_drainfile_present: bool,
 ) -> Result<(), reqwest::Error> {
-    let resp = policy.handle_tally(tally.clone());
+    let resp = policy.handle_tally(tally.clone(), Weight::new(1.0).unwrap());
     if let Some(fw_config) = fw_config {
         if fw_config.delegate_spam_blocking && !mem_drainfile_present {
             let client = nodefw_client

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use mysten_metrics::histogram::Histogram as MystenHistogram;
 use mysten_metrics::spawn_monitored_task;
 use narwhal_worker::LazyNarwhalClient;
+use parking_lot::Mutex;
 use prometheus::{
     register_int_counter_vec_with_registry, register_int_counter_with_registry, IntCounter,
     IntCounterVec, Registry,
@@ -24,8 +25,7 @@ use sui_types::messages_grpc::{
 };
 use sui_types::multiaddr::Multiaddr;
 use sui_types::sui_system_state::SuiSystemState;
-use sui_types::traffic_control::ServiceResponse;
-use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
+use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig, Weight};
 use sui_types::{effects::TransactionEffectsAPI, message_envelope::Message};
 use sui_types::{error::*, transaction::*};
 use sui_types::{
@@ -42,7 +42,7 @@ use crate::{
     authority::AuthorityState,
     consensus_adapter::{ConsensusAdapter, ConsensusAdapterMetrics},
     traffic_controller::policies::TrafficTally,
-    traffic_controller::TrafficController,
+    traffic_controller::{ErrorNormalizer, TrafficController},
 };
 use crate::{
     consensus_adapter::ConnectionMonitorStatusForTests,
@@ -246,11 +246,32 @@ impl ValidatorServiceMetrics {
 }
 
 #[derive(Clone)]
+struct AuthorityServerNormalizer;
+
+// unsafe impl Send for AuthorityServerNormalizer {}
+// unsafe impl Sync for AuthorityServerNormalizer {}
+
+impl ErrorNormalizer<SuiError> for AuthorityServerNormalizer {
+    fn normalize(&self, err: SuiError) -> Weight {
+        match err {
+            SuiError::UserInputError { .. }
+            | SuiError::InvalidSignature { .. }
+            | SuiError::SignerSignatureAbsent { .. }
+            | SuiError::SignerSignatureNumberMismatch { .. }
+            | SuiError::IncorrectSigner { .. }
+            | SuiError::UnknownSigner { .. }
+            | SuiError::WrongEpoch { .. } => Weight::one(),
+            _ => Weight::zero(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ValidatorService {
     state: Arc<AuthorityState>,
     consensus_adapter: Arc<ConsensusAdapter>,
     metrics: Arc<ValidatorServiceMetrics>,
-    traffic_controller: Option<Arc<TrafficController>>,
+    traffic_controller: Option<Arc<TrafficController<SuiError>>>,
 }
 
 impl ValidatorService {
@@ -271,6 +292,7 @@ impl ValidatorService {
                     policy,
                     traffic_controller_metrics,
                     firewall_config,
+                    AuthorityServerNormalizer {},
                 ))
             }),
         }
@@ -655,19 +677,22 @@ impl ValidatorService {
         proxy_ip: Option<SocketAddr>,
         response: &Result<tonic::Response<T>, tonic::Status>,
     ) {
-        let result: SuiResult = if let Err(status) = response {
-            Err(SuiError::from(status.clone()))
+        let error = if let Err(status) = response {
+            Some(SuiError::from(status.clone()))
         } else {
-            Ok(())
+            None
         };
 
         if let Some(traffic_controller) = self.traffic_controller.clone() {
-            traffic_controller.tally(TrafficTally {
-                connection_ip: connection_ip.map(|ip| ip.ip()),
-                proxy_ip: proxy_ip.map(|ip| ip.ip()),
-                result: ServiceResponse::Validator(result),
-                timestamp: SystemTime::now(),
-            })
+            traffic_controller.tally(
+                TrafficTally {
+                    connection_ip: connection_ip.map(|ip| ip.ip()),
+                    proxy_ip: proxy_ip.map(|ip| ip.ip()),
+                    error: error.map(|e| Arc::new(Mutex::new(e))),
+                    timestamp: SystemTime::now(),
+                }
+                .into(),
+            )
         }
     }
 }

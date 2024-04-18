@@ -2,19 +2,20 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{collections::HashMap, error::Error, net::IpAddr, sync::Arc};
 
 use mysten_metrics::spawn_monitored_task;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::fmt::Debug;
 use std::time::SystemTime;
-use sui_types::traffic_control::{PolicyConfig, PolicyType, ServiceResponse};
+use sui_types::traffic_control::{PolicyConfig, PolicyType, Weight};
 
 #[derive(Clone, Debug)]
-pub struct TrafficTally {
+pub struct TrafficTally<E: Error + Clone> {
     pub connection_ip: Option<IpAddr>,
     pub proxy_ip: Option<IpAddr>,
-    pub result: ServiceResponse,
+    // Mutex only needed to make E Send
+    pub error: Option<Arc<Mutex<E>>>,
     pub timestamp: SystemTime,
 }
 
@@ -24,10 +25,10 @@ pub struct PolicyResponse {
     pub block_proxy_ip: Option<IpAddr>,
 }
 
-pub trait Policy {
+pub trait Policy<E: Error + Clone> {
     // returns, e.g. (true, false) if connection_ip should be added to blocklist
     // and proxy_ip should not
-    fn handle_tally(&mut self, tally: TrafficTally) -> PolicyResponse;
+    fn handle_tally(&mut self, tally: Arc<TrafficTally<E>>, weight: Weight) -> PolicyResponse;
     fn policy_config(&self) -> &PolicyConfig;
 }
 
@@ -41,8 +42,8 @@ pub enum TrafficControlPolicy {
     TestPanicOnInvocation(TestPanicOnInvocationPolicy),
 }
 
-impl Policy for TrafficControlPolicy {
-    fn handle_tally(&mut self, tally: TrafficTally) -> PolicyResponse {
+impl<E: Error + Clone> Policy<E> for TrafficControlPolicy {
+    fn handle_tally(&mut self, tally: Arc<TrafficTally<E>>, _weight: Weight) -> PolicyResponse {
         match self {
             TrafficControlPolicy::NoOp(policy) => policy.handle_tally(tally),
             TrafficControlPolicy::TestNConnIP(policy) => policy.handle_tally(tally),
@@ -94,7 +95,7 @@ impl NoOpPolicy {
         Self { config }
     }
 
-    fn handle_tally(&mut self, _tally: TrafficTally) -> PolicyResponse {
+    fn handle_tally<E: Error + Clone>(&mut self, _tally: Arc<TrafficTally<E>>) -> PolicyResponse {
         PolicyResponse::default()
     }
 
@@ -127,7 +128,7 @@ impl TestNConnIPPolicy {
         }
     }
 
-    fn handle_tally(&mut self, tally: TrafficTally) -> PolicyResponse {
+    fn handle_tally<E: Error + Clone>(&mut self, tally: Arc<TrafficTally<E>>) -> PolicyResponse {
         let ip = if let Some(ip) = tally.connection_ip {
             ip
         } else {
@@ -170,7 +171,7 @@ impl TestInspectIpPolicy {
         Self { config }
     }
 
-    fn handle_tally(&mut self, tally: TrafficTally) -> PolicyResponse {
+    fn handle_tally<E: Error + Clone>(&mut self, tally: Arc<TrafficTally<E>>) -> PolicyResponse {
         assert!(tally.proxy_ip.is_some(), "Expected proxy_ip to be present");
         PolicyResponse {
             block_connection_ip: None,
@@ -193,7 +194,7 @@ impl TestPanicOnInvocationPolicy {
         Self { config }
     }
 
-    fn handle_tally(&mut self, _: TrafficTally) -> PolicyResponse {
+    fn handle_tally<E: Error + Clone>(&mut self, _: Arc<TrafficTally<E>>) -> PolicyResponse {
         panic!("Tally for this policy should never be invoked")
     }
 

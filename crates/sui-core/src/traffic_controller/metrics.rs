@@ -14,7 +14,7 @@ pub struct TrafficControllerMetrics {
     pub requests_blocked_at_protocol: IntCounter,
     pub blocks_delegated_to_firewall: IntCounter,
     pub firewall_delegation_request_fail: IntCounter,
-    pub tally_channel_overflow: IntCounter,
+    pub tally_channel_lag: IntCounter,
 }
 
 impl TrafficControllerMetrics {
@@ -58,9 +58,9 @@ impl TrafficControllerMetrics {
                 registry
             )
             .unwrap(),
-            tally_channel_overflow: register_int_counter_with_registry!(
-                "tally_channel_overflow",
-                "Traffic controller tally channel overflow count",
+            tally_channel_lag: register_int_counter_with_registry!(
+                "tally_channel_lag",
+                "Traffic controller skipped tallies due to lag in the tally channel",
                 registry
             )
             .unwrap(),
