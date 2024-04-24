@@ -8,6 +8,7 @@ use mysten_metrics::spawn_logged_monitored_task;
 use shared_crypto::intent::{Intent, IntentMessage};
 use sui_json_rpc_types::{
     SuiExecutionStatus, SuiTransactionBlockEffects, SuiTransactionBlockEffectsAPI,
+    SuiTransactionBlockEvents,
 };
 use sui_types::transaction::ObjectArg;
 use sui_types::{
@@ -19,6 +20,7 @@ use sui_types::{
     transaction::Transaction,
 };
 
+use crate::events::{TokenTransferAlreadyClaimed, TokenTransferClaimed};
 use crate::{
     client::bridge_authority_aggregator::BridgeAuthorityAggregator,
     error::BridgeError,
@@ -357,8 +359,9 @@ where
                 .await
             {
                 Ok(effects) => {
+                    let events = effects.events.expect("We requested events but got None.");
                     let effects = effects.effects.expect("We requested effects but got None.");
-                    Self::handle_execution_effects(tx_digest, effects, &store, action).await
+                    Self::handle_execution_effects(tx_digest, events, effects, &store, action).await
                 }
 
                 // If the transaction did not go through, retry up to a certain times.
@@ -392,6 +395,7 @@ where
     // TODO: do we need a mechanism to periodically read pending actions from DB?
     async fn handle_execution_effects(
         tx_digest: TransactionDigest,
+        events: SuiTransactionBlockEvents,
         effects: SuiTransactionBlockEffects,
         store: &Arc<BridgeOrchestratorTables>,
         action: &BridgeAction,
@@ -399,6 +403,13 @@ where
         let status = effects.status();
         match status {
             SuiExecutionStatus::Success => {
+                // If the transaction is successful, there must be either
+                // TokenTransferAlreadyClaimed or TokenTransferClaimed event.
+                assert!(events
+                    .data
+                    .iter()
+                    .any(|e| e.type_ == *TokenTransferAlreadyClaimed.get().unwrap()
+                        || e.type_ == *TokenTransferClaimed.get().unwrap()),);
                 info!(?tx_digest, "Sui transaction executed successfully");
                 store
                     .remove_pending_actions(&[action.digest()])
@@ -453,12 +464,13 @@ pub async fn submit_to_executor(
 
 #[cfg(test)]
 mod tests {
+    use crate::events::init_all_struct_tags;
     use crate::test_utils::DUMMY_MUTALBE_BRIDGE_OBJECT_ARG;
     use fastcrypto::traits::KeyPair;
     use prometheus::Registry;
     use std::collections::{BTreeMap, HashMap};
     use std::str::FromStr;
-    use sui_json_rpc_types::SuiTransactionBlockResponse;
+    use sui_json_rpc_types::{SuiEvent, SuiTransactionBlockResponse};
     use sui_types::bridge::{TOKEN_ID_BTC, TOKEN_ID_ETH, TOKEN_ID_USDC, TOKEN_ID_USDT};
     use sui_types::crypto::get_key_pair;
     use sui_types::gas_coin::GasCoin;
@@ -526,10 +538,14 @@ mod tests {
         );
 
         // Mock the transaction to be successfully executed
+        let mut event = SuiEvent::random_for_testing();
+        event.type_ = TokenTransferClaimed.get().unwrap().clone();
+        let events = vec![event];
         mock_transaction_response(
             &sui_client_mock,
             tx_digest,
             SuiExecutionStatus::Success,
+            Some(events),
             true,
         );
 
@@ -576,6 +592,7 @@ mod tests {
             SuiExecutionStatus::Failure {
                 error: "failure is mother of success".to_string(),
             },
+            None,
             true,
         );
 
@@ -646,10 +663,14 @@ mod tests {
             .contains_key(&action.digest()));
 
         // Now let it succeed
+        let mut event = SuiEvent::random_for_testing();
+        event.type_ = TokenTransferClaimed.get().unwrap().clone();
+        let events = vec![event];
         mock_transaction_response(
             &sui_client_mock,
             tx_digest,
             SuiExecutionStatus::Success,
+            Some(events),
             true,
         );
 
@@ -762,10 +783,14 @@ mod tests {
         .unwrap();
         let tx_digest = get_tx_digest(tx_data, &dummy_sui_key);
 
+        let mut event = SuiEvent::random_for_testing();
+        event.type_ = TokenTransferClaimed.get().unwrap().clone();
+        let events = vec![event];
         mock_transaction_response(
             &sui_client_mock,
             tx_digest,
             SuiExecutionStatus::Success,
+            Some(events),
             true,
         );
 
@@ -1006,10 +1031,14 @@ mod tests {
         sui_client_mock: &SuiMockClient,
         tx_digest: TransactionDigest,
         status: SuiExecutionStatus,
+        events: Option<Vec<SuiEvent>>,
         wildcard: bool,
     ) {
         let mut response = SuiTransactionBlockResponse::new(tx_digest);
         let effects = SuiTransactionBlockEffects::new_for_testing(tx_digest, status);
+        if let Some(events) = events {
+            response.events = Some(SuiTransactionBlockEvents { data: events });
+        }
         response.effects = Some(effects);
         if wildcard {
             sui_client_mock.set_wildcard_transaction_response(Ok(response));
@@ -1052,6 +1081,7 @@ mod tests {
         telemetry_subscribers::init_for_testing();
         let registry = Registry::new();
         mysten_metrics::init_metrics(&registry);
+        init_all_struct_tags();
 
         let (sui_address, kp): (_, fastcrypto::secp256k1::Secp256k1KeyPair) = get_key_pair();
         let sui_key = SuiKeyPair::from(kp);
