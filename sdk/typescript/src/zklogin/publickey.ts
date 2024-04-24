@@ -160,7 +160,7 @@ async function graphqlVerifyZkLoginSignature({
 			author: address,
 		},
 	});
-
+	console.log('graphql response', resp.data?.verifyZkloginSignature.errors);
 	return (
 		resp.data?.verifyZkloginSignature.success === true &&
 		resp.data?.verifyZkloginSignature.errors.length === 0
