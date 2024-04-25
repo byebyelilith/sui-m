@@ -1,5 +1,11 @@
 # @mysten/kiosk
 
+## 0.8.7
+
+### Patch Changes
+
+- 0511cf3378: Adds pagination option for owned kiosks lookup
+
 ## 0.8.6
 
 ### Patch Changes

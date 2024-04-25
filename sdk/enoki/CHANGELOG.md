@@ -1,5 +1,12 @@
 # @mysten/enoki
 
+## 0.2.3
+
+### Patch Changes
+
+- 049610aeb6: Add network to execution flow
+- 9a1406a396: Add missing network param to enokiflow
+
 ## 0.2.2
 
 ### Patch Changes
