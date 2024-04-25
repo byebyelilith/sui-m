@@ -77,6 +77,16 @@ fn default_drain_timeout() -> u64 {
     TRAFFIC_SINK_TIMEOUT_SEC
 }
 
+// TODO: for now, expose all config levers here for ease of testing and rollout, 
+// but in the future, may want to split into separate policy types for different 
+/// uses, with each having hard coded params
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct FreqThresholdConfig {
+    pub threshold: u64,
+    pub window_size_secs: u64,
+    pub update_interval_secs: u64,
+}
+
 // Serializable representation of policy types, used in config
 // in order to easily change in tests or to killswitch
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -84,6 +94,11 @@ pub enum PolicyType {
     /// Does nothing
     #[default]
     NoOp,
+
+    /// Blocks connection_ip after reaching a tally frequency (tallies per second)
+    /// of `threshold`, as calculated over an average window of `window_size_secs`
+    /// with granularity of `update_interval_secs`
+    FreqThreshold(FreqThresholdConfig),
 
     /* Below this point are test policies, and thus should not be used in production */
     ///
