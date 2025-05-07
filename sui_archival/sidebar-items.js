@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CHECKPOINT_FILE_MAGIC","SUMMARY_FILE_MAGIC"],"enum":["FileType","Manifest"],"fn":["create_file_metadata","create_file_metadata_from_bytes","finalize_manifest","read_manifest","read_manifest_from_bytes","write_manifest"],"mod":["reader"],"struct":["CheckpointUpdates","FileMetadata","ManifestV1"]};
